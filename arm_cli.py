@@ -199,6 +199,14 @@ MOVE_POS_TOL = 0.005        # m
 MOVE_ROT_TOL_DEG = 2.0
 MOVE_SETTLE_STEPS = 10
 MOVE_TIMEOUT_S = 20.0
+# A move also ends early once it stops making progress: neither error has improved
+# by the margins below for MOVE_STALL_S. Logs showed ~30% of moves hovering (often
+# ~6 mm off, just outside tolerance) or pinned far away for the full timeout.
+MOVE_STALL_S = 1.5
+MOVE_PROGRESS_POS = 0.0005  # m
+MOVE_PROGRESS_ROT_DEG = 0.25
+MOVE_NEAR_POS_TOL = 0.010   # m: a stall this close is reported as "settled short of target"
+MOVE_NEAR_ROT_TOL_DEG = 3.0
 
 # Link inertia repair (see Arm.fix_link_inertias). A link whose inertia trace is
 # below mass * MIN_GYRATION^2 is treated as broken and given mass * GYRATION^2 on
@@ -563,6 +571,11 @@ class MoveTask(Task):
         self.settled = 0
         self.steps = 0
         self.max_steps = int(MOVE_TIMEOUT_S / arm.physics_dt())
+        self.stall_steps = int(MOVE_STALL_S / arm.physics_dt())
+        self.best_pos_err = np.inf
+        self.best_rot_err = np.inf
+        self.last_progress = 0
+        self.dt = arm.physics_dt()
         arm.rmp.reset()
 
     def step(self, arm: Arm) -> bool:
@@ -581,8 +594,23 @@ class MoveTask(Task):
         else:
             self.settled = 0
 
+        if pos_err < self.best_pos_err - MOVE_PROGRESS_POS or rot_err < self.best_rot_err - MOVE_PROGRESS_ROT_DEG:
+            self.last_progress = self.steps
+        self.best_pos_err = min(self.best_pos_err, pos_err)
+        self.best_rot_err = min(self.best_rot_err, rot_err)
+
+        elapsed = self.steps * self.dt
         if self.settled >= MOVE_SETTLE_STEPS:
-            say(f"arrived: position error {pos_err * 1000:.1f} mm, rotation error {rot_err:.2f} deg")
+            say(f"arrived: position error {pos_err * 1000:.1f} mm, rotation error {rot_err:.2f} deg "
+                f"({elapsed:.1f} s)")
+            return True
+        if self.steps - self.last_progress >= self.stall_steps and self.settled == 0:
+            if pos_err < MOVE_NEAR_POS_TOL and rot_err < MOVE_NEAR_ROT_TOL_DEG:
+                say(f"settled short of target: position error {pos_err * 1000:.1f} mm, "
+                    f"rotation error {rot_err:.2f} deg (no progress for {MOVE_STALL_S:g} s, {elapsed:.1f} s)")
+            else:
+                say(f"move stalled after {elapsed:.1f} s with position error {pos_err * 1000:.1f} mm "
+                    f"and rotation error {rot_err:.1f} deg (target probably out of reach or blocked).")
             return True
         if self.steps >= self.max_steps:
             say(
