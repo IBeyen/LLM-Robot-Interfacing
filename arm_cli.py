@@ -21,16 +21,21 @@ Commands (type `help` at the arm> prompt):
     move X Y Z q QW QX QY QZ      ... with a quaternion (w, x, y, z).
     move X Y Z keep               ... keeping the current orientation.
     open | close                  open / close the gripper.
-    snap [PATH] [depth]           save a picture from the hand camera as PNG. Default path is
+    snap [PATH] [depth] [now]     save a picture from the hand camera as PNG. Default path is
                                   captures/capture_<timestamp>.png next to this script. Add
                                   `depth` to also save the depth image as <PATH>_depth.npy.
+                                  Add `now` to take it immediately, while the running command
+                                  keeps going, instead of waiting in the queue.
     points [PATH] [ply]           save the 3D world position of EVERY pixel of the hand camera.
                                   <PATH>.npy is a float32 array of shape (H, W, 3) holding world
                                   X Y Z per pixel (NaN where there is no depth) and <PATH>.png is
                                   the matching colour image, so image[row, col] <-> xyz[row, col].
                                   Add `ply` to also write a coloured point cloud (<PATH>.ply) that
                                   opens in MeshLab / CloudCompare. Default PATH is
-                                  captures/points_<timestamp>.
+                                  captures/points_<timestamp>. `now` works as for snap.
+    watch [SECONDS] [PATH]        keep PATH (default captures/live.png) refreshed with the hand
+                                  camera image every SECONDS (default 1) of simulated time, in
+                                  the background, whatever else is running. `watch off` ends it.
     pick X Y Z [to PX PY PZ] [yaw DEG]
                                   run the built-in PickPlaceController: grasp the object whose
                                   centre is at X Y Z, release it at PX PY PZ (default: above the
@@ -50,8 +55,9 @@ Commands (type `help` at the arm> prompt):
     stop                          abort the running action and drop queued ones.
     quit                          close Isaac Sim.
 
-Commands run one after another in the order given. `status`, `stop`, `help` and `quit`
-take effect immediately; everything else waits its turn.
+Commands run one after another in the order given. `status`, `stop`, `help`, `quit`,
+`watch` and `snap`/`points` with `now` take effect immediately; everything else waits
+its turn.
 
 Positions are in the world frame of the stage. The frame that `move` targets and `pose`
 reports is RMPflow's "right_gripper" frame, which sits between the fingertips.
@@ -73,7 +79,9 @@ from datetime import datetime
 # Launch options. Parsed BEFORE SimulationApp is created because Kit has to know
 # about headless mode before it starts.
 # ----------------------------------------------------------------------------
-DEFAULT_USD_PATH = "C:/Users/ilanb/Desktop/Arm with Cam.usd"
+DEFAULT_USD_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "worlds", "Arm with Cam.usd"
+).replace("\\", "/")
 
 
 def parse_launch_args():
@@ -221,6 +229,8 @@ HOME_JOINT_SPEED = 0.6      # rad/s for the slowest-to-arrive joint during `home
 HOME_MIN_DURATION_S = 1.0
 SNAP_SETTLE_STEPS = 5       # rendered frames to wait so the image matches the settled pose
 SNAP_MAX_WAIT_STEPS = 240
+WATCH_DEFAULT_PERIOD_S = 1.0
+WATCH_DEFAULT_PATH = os.path.join(CAPTURE_DIR, "live.png")
 
 EOF_SENTINEL = "\x00eof"
 # ----------------------------------------------------------------------------
@@ -248,6 +258,17 @@ def to_numpy(data):
     if hasattr(data, "numpy"):
         data = data.numpy()
     return np.asarray(data)
+
+
+def camera_rgb(cam: Camera):
+    """Latest hand-camera frame as a contiguous uint8 (H, W, 3) array, or None if there is none yet."""
+    rgba = to_numpy(cam.get_rgba())
+    if rgba is None or rgba.size == 0:
+        return None
+    rgb = rgba[:, :, :3]
+    if rgb.dtype != np.uint8:
+        rgb = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+    return np.ascontiguousarray(rgb)
 
 
 # A USD camera looks down -Z with +Y up; the OpenCV / ROS optical frame looks
@@ -642,9 +663,14 @@ class GripperTask(Task):
 
 
 class CameraTask(Task):
-    """Waits for a fresh frame from the hand camera, then hands it to save()."""
+    """Waits for a fresh frame from the hand camera, then hands it to save().
+
+    With `immediate` set the task does not go through the command queue: the main
+    loop steps it alongside whatever is running, and it takes the next frame as is.
+    """
 
     needs_depth = False
+    immediate = False
 
     def start(self, arm: Arm) -> None:
         self.steps = 0
@@ -654,23 +680,22 @@ class CameraTask(Task):
             say("no camera in the stage; nothing captured.")
             return True
         self.steps += 1
-        if self.steps < SNAP_SETTLE_STEPS:
+        if not self.immediate and self.steps < SNAP_SETTLE_STEPS:
             return False  # let the renderer catch up with the settled arm pose
 
-        rgba = to_numpy(arm.camera.get_rgba())
+        rgb = camera_rgb(arm.camera)
         depth = to_numpy(arm.camera.get_depth()) if self.needs_depth else None
-        have_rgb = rgba is not None and rgba.size > 0
         have_depth = (not self.needs_depth) or (depth is not None and depth.size > 0)
-        if not (have_rgb and have_depth):
+        if rgb is None or not have_depth:
             if self.steps >= SNAP_MAX_WAIT_STEPS:
                 say("camera produced no frame; nothing captured.")
                 return True
             return False
 
-        rgb = rgba[:, :, :3]
-        if rgb.dtype != np.uint8:
-            rgb = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
-        self.save(arm, np.ascontiguousarray(rgb), depth)
+        if self.immediate:
+            # The arm may be mid-move: say where the gripper was for this frame.
+            say(f"captured with the end effector at {fmt(arm.ee_pose()[0])}")
+        self.save(arm, rgb, depth)
         return True
 
     def save(self, arm: Arm, rgb: np.ndarray, depth) -> None:
@@ -678,9 +703,10 @@ class CameraTask(Task):
 
 
 class SnapTask(CameraTask):
-    def __init__(self, path=None, with_depth=False) -> None:
+    def __init__(self, path=None, with_depth=False, immediate=False) -> None:
         self.path = path
         self.needs_depth = with_depth
+        self.immediate = immediate
         self.label = f"snap -> {path or 'captures/'}"
 
     def start(self, arm: Arm) -> None:
@@ -704,9 +730,10 @@ class PointsTask(CameraTask):
 
     needs_depth = True
 
-    def __init__(self, base=None, with_ply=False) -> None:
+    def __init__(self, base=None, with_ply=False, immediate=False) -> None:
         self.base = base
         self.with_ply = with_ply
+        self.immediate = immediate
         self.label = f"points -> {base or 'captures/'}"
 
     def start(self, arm: Arm) -> None:
@@ -735,6 +762,46 @@ class PointsTask(CameraTask):
         if self.with_ply:
             n = write_ply(self.base + ".ply", xyz, rgb)
             say(f"saved {self.base}.ply ({n} coloured points)")
+
+
+class WatchTask(Task):
+    """Rewrites one PNG with the latest hand-camera frame every `period` simulated seconds.
+
+    Never queued and never finishes: the main loop steps it next to the running
+    command until `watch off`. Each frame is written to a temporary file and
+    renamed over the target, so a reader never sees a half-written image.
+    """
+
+    def __init__(self, period: float, path: str) -> None:
+        self.period = period
+        self.path = path
+        self.label = f"watch -> {path} every {period:g} s"
+
+    def start(self, arm: Arm) -> None:
+        self.every = max(1, int(round(self.period / arm.physics_dt())))
+        self.countdown = 0
+        self.frames = 0
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+
+    def step(self, arm: Arm) -> bool:
+        self.countdown -= 1
+        if self.countdown > 0:
+            return False
+        rgb = camera_rgb(arm.camera)
+        if rgb is None or not rgb.any():
+            # No frame yet, or the all-black one the renderer hands out right after a
+            # reset: keep the last good image and try again next step.
+            return False
+        tmp =self.path + ".tmp"
+        try:
+            # Fast compression: this runs inside the simulation loop.
+            Image.fromarray(rgb).save(tmp, format="PNG", compress_level=1)
+            os.replace(tmp, self.path)
+            self.frames += 1
+        except OSError:
+            pass  # target is open in a viewer right now; the next frame replaces it
+        self.countdown = self.every
+        return False
 
 
 class PickPlaceTask(Task):
@@ -919,9 +986,12 @@ HELP = """Commands:
   move X Y Z q QW QX QY QZ           orientation as a quaternion (w x y z)
   move X Y Z keep                    keep the current orientation
   open | close                       gripper
-  snap [PATH] [depth]                save a camera image (PNG), optionally depth too (.npy)
-  points [PATH] [ply]                save world XYZ of every pixel: PATH.npy (H,W,3) + PATH.png,
-                                     add ply for a coloured point cloud (PATH.ply)
+  snap [PATH] [depth] [now]          save a camera image (PNG), optionally depth too (.npy);
+                                     now = immediately, while the running command continues
+  points [PATH] [ply] [now]          save world XYZ of every pixel: PATH.npy (H,W,3) + PATH.png,
+                                     add ply for a coloured point cloud (PATH.ply); now as above
+  watch [SECONDS] [PATH] | watch off immediately: refresh PATH (default captures/live.png) with
+                                     the camera image every SECONDS (default 1) in the background
   pick X Y Z [to PX PY PZ] [yaw DEG] run the pick-and-place controller
   pose                               print the end-effector pose (runs in queue order)
   joints                             print joint readings, limits, and joint 1 reading vs physical
@@ -985,27 +1055,56 @@ def parse_pick(args):
 def parse_snap(args):
     path = None
     with_depth = False
+    immediate = False
     for tok in args:
         if tok.lower() == "depth":
             with_depth = True
+        elif tok.lower() == "now":
+            immediate = True
         elif path is None:
             path = tok
         else:
-            raise ValueError("usage: snap [PATH] [depth]")
-    return SnapTask(path, with_depth)
+            raise ValueError("usage: snap [PATH] [depth] [now]")
+    return SnapTask(path, with_depth, immediate)
 
 
 def parse_points(args):
     base = None
     with_ply = False
+    immediate = False
     for tok in args:
         if tok.lower() == "ply":
             with_ply = True
+        elif tok.lower() == "now":
+            immediate = True
         elif base is None:
             base = tok
         else:
-            raise ValueError("usage: points [PATH] [ply]")
-    return PointsTask(base, with_ply)
+            raise ValueError("usage: points [PATH] [ply] [now]")
+    return PointsTask(base, with_ply, immediate)
+
+
+def parse_watch(args):
+    """`watch [SECONDS] [PATH]` -> WatchTask, `watch off` -> None."""
+    usage = "usage: watch [SECONDS] [PATH] | watch off"
+    if len(args) == 1 and args[0].lower() in ("off", "stop"):
+        return None
+    period = None
+    path = None
+    for tok in args:
+        try:
+            value = float(tok)
+        except ValueError:
+            value = None
+        if value is not None and period is None:
+            period = value
+        elif value is None and path is None:
+            path = tok
+        else:
+            raise ValueError(usage)
+    if period is not None and not period > 0:
+        raise ValueError("watch: SECONDS must be greater than 0")
+    return WatchTask(WATCH_DEFAULT_PERIOD_S if period is None else period, path or WATCH_DEFAULT_PATH)
 
 
 def build_task(argv):
@@ -1071,6 +1170,8 @@ def main() -> None:
 
     pending: list = []
     current = None
+    captures: list = []   # `snap now` / `points now`: stepped alongside `current`
+    watch = None          # the running WatchTask, if any
     quit_requested = False
 
     while simulation_app.is_running() and not quit_requested:
@@ -1107,15 +1208,41 @@ def main() -> None:
                     pending.clear()
             elif cmd == "status":
                 running = current.label if current is not None else "idle"
-                say(f"running: {running}; queued: {len(pending)}")
+                watching = "off" if watch is None else f"{watch.path} every {watch.period:g} s ({watch.frames} frames)"
+                say(f"running: {running}; queued: {len(pending)}; watch: {watching}")
                 arm.print_pose()
+            elif cmd == "watch":
+                try:
+                    new_watch = parse_watch(argv[1:])
+                except ValueError as exc:
+                    say(f"error: {exc}")
+                    continue
+                if new_watch is not None and arm.camera is None:
+                    say("no camera in the stage; watch is disabled.")
+                    continue
+                if watch is not None:
+                    say(f"watch off: {watch.frames} frame(s) written to {watch.path}")
+                elif new_watch is None:
+                    say("watch is not running.")
+                watch = new_watch
+                if watch is not None:
+                    watch.start(arm)
+                    say(f"watch on: {watch.path} refreshed every {watch.period:g} s (`watch off` ends it)")
             elif cmd in ("help", "?"):
                 print(HELP, flush=True)
             else:
                 try:
-                    pending.append(build_task(argv))
+                    task = build_task(argv)
                 except ValueError as exc:
                     say(f"error: {exc}")
+                    continue
+                if getattr(task, "immediate", False):
+                    # Not "> label": that prefix marks the start of a queued command.
+                    say(f"now: {task.label}")
+                    task.start(arm)
+                    captures.append(task)
+                else:
+                    pending.append(task)
 
         if quit_requested:
             break
@@ -1130,7 +1257,8 @@ def main() -> None:
                 current = None
             pending.clear()
 
-        if current is None and pending:
+        # An ordered quit waits for `now` captures that are still after their frame.
+        if current is None and pending and not (isinstance(pending[0], QuitTask) and captures):
             current = pending.pop(0)
             if isinstance(current, QuitTask):
                 break
@@ -1141,10 +1269,16 @@ def main() -> None:
             arm.hold()
             current = None
 
+        captures = [task for task in captures if not task.step(arm)]
+        if watch is not None:
+            watch.step(arm)
+
         arm.trace(current.label if current is not None else "idle")
 
     if arm.trace_file is not None:
         arm.trace_file.close()
+    if watch is not None:
+        say(f"watch off: {watch.frames} frame(s) written to {watch.path}")
     say("closing.")
     simulation_app.close()
 
