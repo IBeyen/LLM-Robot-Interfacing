@@ -59,11 +59,15 @@ Commands (type `help` at the arm> prompt):
                                   `snap`/`points` capture (point clouds included), every command
                                   and every "[arm]" line. Default PATH is
                                   runs/foxglove/arm_<timestamp>.mcap. See foxglove_recorder.py.
+    note TEXT...                  immediately write TEXT into the recording (/notes topic), stamped
+                                  at the moment it is typed. Use it to annotate what you see.
+    mark TEXT...                  the same, but queued: the note is stamped when its turn comes in
+                                  the command sequence (e.g. right after a move finishes).
     quit                          close Isaac Sim.
 
 Commands run one after another in the order given. `status`, `stop`, `help`, `quit`,
-`watch`, `record` and `snap`/`points` with `now` take effect immediately; everything
-else waits its turn.
+`watch`, `record`, `note` and `snap`/`points` with `now` take effect immediately;
+everything else waits its turn.
 
 Positions are in the world frame of the stage. The frame that `move` targets and `pose`
 reports is RMPflow's "right_gripper" frame, which sits between the fingertips.
@@ -532,12 +536,13 @@ class Arm:
             say(f"WARNING: recording stopped after an error: {exc!r}")
             self.stop_recording()
 
-    def record_capture(self, rgb: np.ndarray, xyz=None) -> None:
-        """A `snap` / `points` result: full-quality image, plus the world-frame cloud if given."""
+    def record_capture(self, rgb: np.ndarray, path: str = "", xyz=None) -> None:
+        """An image arm_cli handed out (`snap`, `points`, `watch`): goes to /hand_camera/retrieved
+        at full quality, plus the world-frame cloud on /hand_camera/points if given."""
         if self.recorder is None:
             return
         t = self.sim_time()
-        self.recorder.image("/hand_camera/snap", t, rgb, quality=95)
+        self.recorder.retrieved_image(t, rgb, path)
         if xyz is not None:
             n = self.recorder.point_cloud(t, xyz, rgb)
             say(f"recorded {n} points on /hand_camera/points (stride {self.recorder.point_stride})")
@@ -884,7 +889,7 @@ class SnapTask(CameraTask):
             depth_path = os.path.splitext(self.path)[0] + "_depth.npy"
             np.save(depth_path, depth)
             say(f"saved {depth_path} (float32 metres, shape {depth.shape})")
-        arm.record_capture(rgb)
+        arm.record_capture(rgb, self.path)
 
 
 class PointsTask(CameraTask):
@@ -924,7 +929,7 @@ class PointsTask(CameraTask):
         if self.with_ply:
             n = write_ply(self.base + ".ply", xyz, rgb)
             say(f"saved {self.base}.ply ({n} coloured points)")
-        arm.record_capture(rgb, xyz)
+        arm.record_capture(rgb, self.base + ".png", xyz)
 
 
 class WatchTask(Task):
@@ -961,6 +966,7 @@ class WatchTask(Task):
             Image.fromarray(rgb).save(tmp, format="PNG", compress_level=1)
             os.replace(tmp, self.path)
             self.frames += 1
+            arm.record_capture(rgb)   # no path: one log line per second would drown /log
         except OSError:
             pass  # target is open in a viewer right now; the next frame replaces it
         self.countdown = self.every
@@ -1132,6 +1138,22 @@ class ResetTask(Task):
         return True
 
 
+class MarkTask(Task):
+    """`mark TEXT`: a note stamped when it reaches the front of the queue."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.label = f"mark {text!r}"
+
+    def step(self, arm: Arm) -> bool:
+        if arm.recorder is None:
+            say(f"mark (not recording): {self.text}")
+        else:
+            arm.recorder.note(arm.sim_time(), self.text, "mark")
+            say(f"mark: {self.text}")
+        return True
+
+
 class QuitTask(Task):
     """Ordered quit: runs after everything queued before it (used for -c / piped input)."""
     label = "quit"
@@ -1166,6 +1188,8 @@ HELP = """Commands:
   stop                               abort the running action, drop queued ones
   record [PATH] | record off         immediately: start / end recording the session to an MCAP
                                      file for Foxglove (default runs/foxglove/arm_<timestamp>.mcap)
+  note TEXT...                       immediately: write TEXT into the recording (/notes), stamped now
+  mark TEXT...                       same, but queued: stamped when its turn comes in the sequence
   help | quit"""
 
 
@@ -1302,6 +1326,10 @@ def build_task(argv):
         return ResetTask()
     if cmd == "wait":
         return WaitTask(_floats(args, 1, "seconds")[0])
+    if cmd == "mark":
+        if not args:
+            raise ValueError("usage: mark TEXT...")
+        return MarkTask(" ".join(args))
     raise ValueError(f"unknown command {cmd!r} (type help)")
 
 
@@ -1384,6 +1412,15 @@ def main() -> None:
                 recording = "off" if arm.recorder is None else arm.recorder.path
                 say(f"running: {running}; queued: {len(pending)}; watch: {watching}; recording: {recording}")
                 arm.print_pose()
+            elif cmd == "note":
+                text = line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else ""
+                if not text:
+                    say("error: usage: note TEXT...")
+                elif arm.recorder is None:
+                    say(f"note (not recording): {text}")
+                else:
+                    arm.recorder.note(arm.sim_time(), text, "note")
+                    say(f"note: {text}")
             elif cmd == "record":
                 if len(argv) == 2 and argv[1].lower() in ("off", "stop"):
                     if arm.recorder is None:

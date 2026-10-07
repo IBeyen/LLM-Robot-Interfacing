@@ -16,7 +16,9 @@ Topics written:
     /log                   foxglove.Log  every "[arm] ..." line the CLI prints
     /hand_camera/image     foxglove.CompressedImage  JPEG from the hand camera, throttled (see image_period)
     /hand_camera/calibration  foxglove.CameraCalibration  intrinsics, once per start and on resolution change
-    /hand_camera/snap      foxglove.CompressedImage  full-quality image of every `snap` / `points` capture
+    /hand_camera/retrieved foxglove.CompressedImage  the last image arm_cli handed out: every `snap`,
+                                  `points` and `watch` frame, full quality, at the moment it was saved
+    /notes                 foxglove.Log  free text from the `note` (immediate) / `mark` (queued) commands
     /hand_camera/points    foxglove.PointCloud  the world-frame cloud of every `points` capture
     /viewport/image        foxglove.CompressedImage  the Isaac Sim perspective viewport, same throttle
     /sim                   JSON   {sim_time, step, physics_dt} every step
@@ -138,7 +140,8 @@ TOPICS: Dict[str, str] = {
     "/log": "foxglove.Log",
     "/hand_camera/image": "foxglove.CompressedImage",
     "/hand_camera/calibration": "foxglove.CameraCalibration",
-    "/hand_camera/snap": "foxglove.CompressedImage",
+    "/hand_camera/retrieved": "foxglove.CompressedImage",
+    "/notes": "foxglove.Log",
     "/hand_camera/points": "foxglove.PointCloud",
     "/viewport/image": "foxglove.CompressedImage",
     "/sim": "arm_cli.Sim",
@@ -323,6 +326,16 @@ class McapRecorder:
 
     def log(self, t: float, message: str, level: int = LOG_INFO) -> None:
         self.write("/log", t, {"level": level, "message": message, "name": "arm_cli", "file": "", "line": 0})
+
+    def note(self, t: float, text: str, source: str = "note") -> None:
+        """Free text typed by the user, stamped at `t` like any other message."""
+        self.write("/notes", t, {"level": LOG_INFO, "message": text, "name": source, "file": "", "line": 0})
+
+    def retrieved_image(self, t: float, rgb: np.ndarray, path: str = "") -> None:
+        """An image arm_cli wrote to disk (snap / points / watch). `path` goes to /log."""
+        self.image("/hand_camera/retrieved", t, rgb, quality=95)
+        if path:
+            self.log(t, f"retrieved image -> {path}")
 
     # ---- camera -------------------------------------------------------------------
     def image_due(self, topic: str, t: float) -> bool:

@@ -74,6 +74,9 @@ class TestMcapRecorder(unittest.TestCase):
                 rec.camera_calibration(t, np.array([[10, 0, 6], [0, 10, 4], [0, 0, 1]]), 12, 8)
                 rec.image("/hand_camera/image", t, rgb)
         rec.log(0.1, "arrived: position error 1.0 mm")
+        rec.retrieved_image(0.1, rgb, "captures/x.png")
+        rec.note(0.12, "cube looks off-centre", "note")
+        rec.note(0.13, "after the move", "mark")
         n = rec.point_cloud(0.1, xyz, rgb)
         rec.task(0.1, "done", "move to [0.4 0 0.3]")
         rec.close()
@@ -88,7 +91,9 @@ class TestMcapRecorder(unittest.TestCase):
         self.assertEqual(counts["/hand_camera/points"], 1)
         self.assertEqual(counts["/task"], 2)
         self.assertEqual(counts["/commands"], 1)
-        self.assertEqual(counts["/log"], 1)
+        self.assertEqual(counts["/log"], 2, "the arrived line plus the retrieved-image line")
+        self.assertEqual(counts["/hand_camera/retrieved"], 1)
+        self.assertEqual(counts["/notes"], 2)
         self.assertEqual(counts, rec.counts)
 
         msgs = read_all(self.path)
@@ -131,6 +136,14 @@ class TestMcapRecorder(unittest.TestCase):
         schema, log, _ = by_topic["/log"][0]
         self.assertEqual(schema, "foxglove.Log")
         self.assertEqual(log["level"], 2)
+        self.assertIn("captures/x.png", by_topic["/log"][1][1]["message"])
+
+        schema, note, log_time = by_topic["/notes"][0]
+        self.assertEqual(schema, "foxglove.Log")
+        self.assertEqual((note["name"], note["message"]), ("note", "cube looks off-centre"))
+        self.assertEqual(log_time, 1_000_000_000_000 + round(0.12 * 1e9))
+        self.assertEqual(by_topic["/notes"][1][1]["name"], "mark")
+        self.assertEqual(by_topic["/hand_camera/retrieved"][0][1]["frame_id"], "hand_camera")
 
     def test_clock_never_runs_backwards(self):
         rec = McapRecorder(self.path, epoch_ns=0)
