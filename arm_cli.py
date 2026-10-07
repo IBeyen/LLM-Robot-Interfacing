@@ -53,11 +53,17 @@ Commands (type `help` at the arm> prompt):
     status                        immediately print what is running, how many commands are
                                   queued, and the live pose (works while a move is running).
     stop                          abort the running action and drop queued ones.
+    record [PATH] | record off    immediately start (or end) recording the session to an MCAP
+                                  file for Foxglove: joint states, targets, end-effector pose,
+                                  link transforms, hand-camera and viewport images, every
+                                  `snap`/`points` capture (point clouds included), every command
+                                  and every "[arm]" line. Default PATH is
+                                  runs/foxglove/arm_<timestamp>.mcap. See foxglove_recorder.py.
     quit                          close Isaac Sim.
 
 Commands run one after another in the order given. `status`, `stop`, `help`, `quit`,
-`watch` and `snap`/`points` with `now` take effect immediately; everything else waits
-its turn.
+`watch`, `record` and `snap`/`points` with `now` take effect immediately; everything
+else waits its turn.
 
 Positions are in the world frame of the stage. The frame that `move` targets and `pose`
 reports is RMPflow's "right_gripper" frame, which sits between the fingertips.
@@ -65,7 +71,9 @@ reports is RMPflow's "right_gripper" frame, which sits between the fingertips.
 Launch flags: --headless, --usd PATH, -c "cmd; cmd", --quit-when-done, --events-dt a,..,j
 (pick-place phase timings), --no-fix-inertia (keep the stage's link inertias; see
 Arm.fix_link_inertias for why they are repaired by default), --trace FILE (per-step
-joint CSV for diagnosing motion problems). Tests: test_arm_cli.py.
+joint CSV for diagnosing motion problems), --record [PATH] (start recording to MCAP at
+launch; --record-hz, --record-stride and --no-record-viewport tune it).
+Tests: test_arm_cli.py, test_foxglove_recorder.py.
 """
 
 import argparse
@@ -120,6 +128,25 @@ def parse_launch_args():
         help="write one CSV row per physics step (time, task, joint positions, joint velocities, "
              "physical joint-1 angle) to this file, for diagnosing joint-reading problems",
     )
+    parser.add_argument(
+        "--record", nargs="?", const="", default=None, metavar="PATH",
+        help="record the session to an MCAP file for Foxglove from launch on (same as the "
+             "`record` command). Without PATH: runs/foxglove/arm_<timestamp>.mcap",
+    )
+    parser.add_argument(
+        "--record-hz", type=float, default=5.0, metavar="HZ",
+        help="camera image rate (simulated seconds) in the recording. Default 5. Joint states, "
+             "poses and transforms are always recorded every physics step",
+    )
+    parser.add_argument(
+        "--record-stride", type=int, default=2, metavar="N",
+        help="keep every N-th pixel row and column of a `points` cloud in the recording "
+             "(1 = all 2 M points of a 1080p frame, about 33 MB each). Default 2",
+    )
+    parser.add_argument(
+        "--no-record-viewport", action="store_true",
+        help="do not record the Isaac Sim perspective viewport (/viewport/image)",
+    )
     return parser.parse_args()
 
 
@@ -172,6 +199,8 @@ from isaacsim.robot.manipulators.examples.franka.controllers import (
 )
 from isaacsim.sensors.camera import Camera
 from PIL import Image
+
+from foxglove_recorder import CAMERA_FRAME, LOG_INFO, LOG_WARNING, McapRecorder
 
 # ----------------------------------------------------------------------------
 # CONFIG - matches the other scripts in this folder.
@@ -232,12 +261,23 @@ SNAP_MAX_WAIT_STEPS = 240
 WATCH_DEFAULT_PERIOD_S = 1.0
 WATCH_DEFAULT_PATH = os.path.join(CAPTURE_DIR, "live.png")
 
+# Foxglove recording (see foxglove_recorder.py and the `record` command).
+RECORD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "foxglove")
+VIEWPORT_CAMERA_PRIM_PATH = "/OmniverseKit_Persp"   # the GUI's Perspective viewport camera
+VIEWPORT_RESOLUTION = (1280, 720)
+VIEWPORT_FRAME = "viewport_camera"
+
 EOF_SENTINEL = "\x00eof"
 # ----------------------------------------------------------------------------
+
+_ARM = None  # the live Arm, so say() can copy its output into the recording
 
 
 def say(msg: str) -> None:
     print(f"[arm] {msg}", flush=True)
+    if _ARM is not None and _ARM.recorder is not None:
+        level = LOG_WARNING if msg.startswith(("WARNING", "error", "OUTSIDE")) else LOG_INFO
+        _ARM.recorder.log(_ARM.sim_time(), msg, level)
 
 
 def fmt(v) -> str:
@@ -330,6 +370,10 @@ class Arm:
     """The stage, the Franka, both controllers and the hand camera."""
 
     def __init__(self, usd_path: str) -> None:
+        global _ARM
+        self.recorder = None
+        self.viewport_camera = None
+        _ARM = self
         say(f"opening stage {usd_path}")
         if not open_stage(usd_path):
             raise RuntimeError(f"open_stage failed - could not open {usd_path}")
@@ -380,6 +424,123 @@ class Arm:
             self.trace_file.write(",".join(cols) + "\n")
 
         self.go_to_default_pose()
+
+    # ---- Foxglove recording -------------------------------------------------------
+    def sim_time(self) -> float:
+        try:
+            return float(self.world.current_time)
+        except Exception:
+            return 0.0
+
+    def start_recording(self, path: str = "") -> None:
+        """Start (or restart, to a new file) the MCAP recording; see foxglove_recorder.py."""
+        if self.recorder is not None:
+            self.stop_recording()
+        if not path:
+            path = os.path.join(RECORD_DIR, datetime.now().strftime("arm_%Y%m%d_%H%M%S.mcap"))
+        elif not path.lower().endswith(".mcap"):
+            path += ".mcap"
+        if not LAUNCH.no_record_viewport and self.viewport_camera is None:
+            self.viewport_camera = self._attach_viewport_camera()
+        self.recorder = McapRecorder(
+            path,
+            image_period_s=1.0 / max(LAUNCH.record_hz, 1e-3),
+            point_stride=LAUNCH.record_stride,
+        )
+        self.recorder.log(self.sim_time(), f"recording started: stage {LAUNCH.usd}")
+        say(f"recording to {self.recorder.path} (images at {LAUNCH.record_hz:g} Hz, "
+            f"viewport {'on' if self.viewport_camera is not None else 'off'}; `record off` ends it)")
+
+    def stop_recording(self) -> None:
+        if self.recorder is None:
+            return
+        rec = self.recorder
+        self.recorder = None   # say() must not write into a file being closed
+        rec.close()
+        size_mb = os.path.getsize(rec.path) / 1e6
+        say(f"recording saved: {rec.path} ({size_mb:.1f} MB; {rec.summary()})")
+
+    def _attach_viewport_camera(self):
+        """A render product on the GUI's Perspective camera, so the recording shows the scene
+        the way the user sees it. Returns None (with a warning) when that is not possible."""
+        if not is_prim_path_valid(VIEWPORT_CAMERA_PRIM_PATH):
+            say(f"WARNING: no viewport camera at {VIEWPORT_CAMERA_PRIM_PATH!r}; /viewport/image is off.")
+            return None
+        try:
+            cam = Camera(prim_path=VIEWPORT_CAMERA_PRIM_PATH, resolution=VIEWPORT_RESOLUTION)
+            cam.initialize()
+            return cam
+        except Exception as exc:
+            say(f"WARNING: could not attach to the viewport camera ({exc}); /viewport/image is off.")
+            return None
+
+    def link_poses(self):
+        """{link name: (position, (w, x, y, z))} for every articulation link, from one PhysX read."""
+        view = self.franka._articulation_view
+        out = {}
+        try:
+            tf = np.asarray(view._physics_view.get_link_transforms(), dtype=float).reshape(view.count, -1, 7)[0]
+            for i, name in enumerate(view.body_names):
+                row = tf[i]
+                out[name] = (row[:3].copy(), np.array([row[6], row[3], row[4], row[5]]))
+        except Exception:
+            for name in view.body_names:
+                out[name] = self.link_pose(name)
+        return out
+
+    def record_step(self, task_label: str) -> None:
+        """One recording sample per physics step: joints, targets, EE pose, transforms, images."""
+        rec = self.recorder
+        if rec is None:
+            return
+        t = self.sim_time()
+        try:
+            q = self.franka.get_joint_positions()
+            v = self.franka.get_joint_velocities()
+            target_q = target_v = None
+            try:
+                applied = self.franka.get_articulation_controller().get_applied_action()
+                target_q, target_v = applied.joint_positions, applied.joint_velocities
+            except Exception:
+                pass
+            rec.joint_states(t, self.franka.dof_names, q, v, target_q, target_v, task_label)
+
+            pos, rot = self.ee_pose()
+            rec.ee_pose(t, pos, rot_matrix_to_quat(rot))
+
+            frames = [(name, p, quat) for name, (p, quat) in self.link_poses().items()]
+            if self.camera is not None:
+                cam_pos, cam_quat = self.camera.get_world_pose(camera_axes="ros")
+                frames.append((CAMERA_FRAME, np.asarray(cam_pos, dtype=float), np.asarray(cam_quat, dtype=float)))
+            if self.viewport_camera is not None:
+                vp_pos, vp_quat = self.viewport_camera.get_world_pose(camera_axes="ros")
+                frames.append((VIEWPORT_FRAME, np.asarray(vp_pos, dtype=float), np.asarray(vp_quat, dtype=float)))
+            rec.transforms(t, frames)
+            rec.sim(t, int(self.world.current_time_step_index), self.physics_dt())
+
+            if self.camera is not None and rec.image_due("/hand_camera/image", t):
+                rgb = camera_rgb(self.camera)
+                if rgb is not None and rgb.any():
+                    rec.camera_calibration(t, self.camera.get_intrinsics_matrix(), rgb.shape[1], rgb.shape[0])
+                    rec.image("/hand_camera/image", t, rgb)
+            if self.viewport_camera is not None and rec.image_due("/viewport/image", t):
+                rgb = camera_rgb(self.viewport_camera)
+                if rgb is not None and rgb.any():
+                    rec.image("/viewport/image", t, rgb, frame_id=VIEWPORT_FRAME)
+        except Exception as exc:
+            # Never let the recording take the simulation down: close the file and stop.
+            say(f"WARNING: recording stopped after an error: {exc!r}")
+            self.stop_recording()
+
+    def record_capture(self, rgb: np.ndarray, xyz=None) -> None:
+        """A `snap` / `points` result: full-quality image, plus the world-frame cloud if given."""
+        if self.recorder is None:
+            return
+        t = self.sim_time()
+        self.recorder.image("/hand_camera/snap", t, rgb, quality=95)
+        if xyz is not None:
+            n = self.recorder.point_cloud(t, xyz, rgb)
+            say(f"recorded {n} points on /hand_camera/points (stride {self.recorder.point_stride})")
 
     def link_pose(self, link_name: str):
         """World position and (w, x, y, z) quaternion of one articulation link.
@@ -723,6 +884,7 @@ class SnapTask(CameraTask):
             depth_path = os.path.splitext(self.path)[0] + "_depth.npy"
             np.save(depth_path, depth)
             say(f"saved {depth_path} (float32 metres, shape {depth.shape})")
+        arm.record_capture(rgb)
 
 
 class PointsTask(CameraTask):
@@ -762,6 +924,7 @@ class PointsTask(CameraTask):
         if self.with_ply:
             n = write_ply(self.base + ".ply", xyz, rgb)
             say(f"saved {self.base}.ply ({n} coloured points)")
+        arm.record_capture(rgb, xyz)
 
 
 class WatchTask(Task):
@@ -1001,6 +1164,8 @@ HELP = """Commands:
   wait SECONDS                       pause the queue
   status                             immediately: what is running, queue length, live pose
   stop                               abort the running action, drop queued ones
+  record [PATH] | record off         immediately: start / end recording the session to an MCAP
+                                     file for Foxglove (default runs/foxglove/arm_<timestamp>.mcap)
   help | quit"""
 
 
@@ -1166,6 +1331,9 @@ def main() -> None:
     if not (LAUNCH.commands and LAUNCH.quit_when_done):
         threading.Thread(target=stdin_reader, args=(cmd_queue,), daemon=True).start()
 
+    if LAUNCH.record is not None:
+        arm.start_recording(LAUNCH.record)
+
     say(f"ready. {len(arm.franka.dof_names)} DOFs, camera {'on' if arm.camera else 'off'}. Type help for commands.")
 
     pending: list = []
@@ -1195,6 +1363,8 @@ def main() -> None:
                 say(f"could not parse {line!r}: {exc}")
                 continue
             cmd = argv[0].lower()
+            if arm.recorder is not None:
+                arm.recorder.command(arm.sim_time(), line)
             if cmd in ("quit", "exit"):
                 quit_requested = True
             elif cmd == "stop":
@@ -1202,6 +1372,8 @@ def main() -> None:
                     current.cancel(arm)
                     arm.hold()
                     say(f"aborted: {current.label}")
+                    if arm.recorder is not None:
+                        arm.recorder.task(arm.sim_time(), "aborted", current.label)
                     current = None
                 if pending:
                     say(f"dropped {len(pending)} queued command(s)")
@@ -1209,8 +1381,18 @@ def main() -> None:
             elif cmd == "status":
                 running = current.label if current is not None else "idle"
                 watching = "off" if watch is None else f"{watch.path} every {watch.period:g} s ({watch.frames} frames)"
-                say(f"running: {running}; queued: {len(pending)}; watch: {watching}")
+                recording = "off" if arm.recorder is None else arm.recorder.path
+                say(f"running: {running}; queued: {len(pending)}; watch: {watching}; recording: {recording}")
                 arm.print_pose()
+            elif cmd == "record":
+                if len(argv) == 2 and argv[1].lower() in ("off", "stop"):
+                    if arm.recorder is None:
+                        say("recording is not running.")
+                    arm.stop_recording()
+                elif len(argv) <= 2:
+                    arm.start_recording(argv[1] if len(argv) == 2 else "")
+                else:
+                    say("error: usage: record [PATH] | record off")
             elif cmd == "watch":
                 try:
                     new_watch = parse_watch(argv[1:])
@@ -1254,6 +1436,8 @@ def main() -> None:
             arm.on_timeline_restart()
             if current is not None:
                 say(f"timeline restarted; aborted {current.label}")
+                if arm.recorder is not None:
+                    arm.recorder.task(arm.sim_time(), "aborted", current.label)
                 current = None
             pending.clear()
 
@@ -1263,20 +1447,27 @@ def main() -> None:
             if isinstance(current, QuitTask):
                 break
             say(f"> {current.label}")
+            if arm.recorder is not None:
+                arm.recorder.task(arm.sim_time(), "start", current.label)
             current.start(arm)
 
         if current is not None and current.step(arm):
             arm.hold()
+            if arm.recorder is not None:
+                arm.recorder.task(arm.sim_time(), "done", current.label)
             current = None
 
         captures = [task for task in captures if not task.step(arm)]
         if watch is not None:
             watch.step(arm)
 
-        arm.trace(current.label if current is not None else "idle")
+        label = current.label if current is not None else "idle"
+        arm.trace(label)
+        arm.record_step(label)
 
     if arm.trace_file is not None:
         arm.trace_file.close()
+    arm.stop_recording()
     if watch is not None:
         say(f"watch off: {watch.frames} frame(s) written to {watch.path}")
     say("closing.")
