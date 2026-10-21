@@ -65,7 +65,9 @@ reports is RMPflow's "right_gripper" frame, which sits between the fingertips.
 Launch flags: --headless, --usd PATH, -c "cmd; cmd", --quit-when-done, --events-dt a,..,j
 (pick-place phase timings), --no-fix-inertia (keep the stage's link inertias; see
 Arm.fix_link_inertias for why they are repaired by default), --trace FILE (per-step
-joint CSV for diagnosing motion problems). Tests: test_arm_cli.py.
+joint CSV for diagnosing motion problems), --profile [FRAMES] (wall time per part of the
+main loop), --render-every N (render every Nth physics step, default 8), --camera-res WxH (hand
+camera size). Tests: test_arm_cli.py.
 """
 
 import argparse
@@ -73,6 +75,8 @@ import os
 import queue
 import shlex
 import threading
+import time
+from collections import defaultdict
 from datetime import datetime
 
 # ----------------------------------------------------------------------------
@@ -120,7 +124,33 @@ def parse_launch_args():
         help="write one CSV row per physics step (time, task, joint positions, joint velocities, "
              "physical joint-1 angle) to this file, for diagnosing joint-reading problems",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--profile", type=int, nargs="?", const=300, default=0, metavar="FRAMES",
+        help="print the average wall time of each part of the main loop every FRAMES "
+             "frames (default 300) and a summary at exit, for finding what makes the loop slow",
+    )
+    parser.add_argument(
+        "--render-every", type=int, default=8, metavar="N",
+        help="render only every Nth physics step (default 8; 1 renders every step for a smooth "
+             "viewport). Steps that a camera command or `watch` reads are always rendered; "
+             "rendering is ~85%% of a step, so N=8 runs ~6x faster than N=1",
+    )
+    parser.add_argument(
+        "--camera-res", default="1920x1080", metavar="WxH",
+        help="hand camera resolution (default 1920x1080). Smaller renders faster; "
+             "snap/points images and XYZ arrays come out at this size",
+    )
+    args = parser.parse_args()
+    if args.render_every < 1:
+        parser.error("--render-every must be at least 1")
+    try:
+        w, h = (int(v) for v in args.camera_res.lower().split("x"))
+    except ValueError:
+        parser.error("--camera-res must look like 1280x720")
+    if w < 16 or h < 16:
+        parser.error("--camera-res: width and height must be at least 16")
+    args.camera_res = (w, h)
+    return args
 
 
 def resolve_stage_path(path: str) -> str:
@@ -178,7 +208,7 @@ from PIL import Image
 # ----------------------------------------------------------------------------
 FRANKA_PRIM_PATH = "/Franka"
 CAMERA_PRIM_PATH = "/Franka/panda_hand/Cube/Hand_Camera"
-CAMERA_RESOLUTION = (1920, 1080)
+CAMERA_RESOLUTION = LAUNCH.camera_res  # (width, height); --camera-res
 CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
 
 # Home configuration of the 7 arm joints (fingers are handled separately).
@@ -238,6 +268,78 @@ EOF_SENTINEL = "\x00eof"
 
 def say(msg: str) -> None:
     print(f"[arm] {msg}", flush=True)
+
+
+class LoopProfiler:
+    """--profile: wall time per section of the main loop.
+
+    mark(name) charges the time since the previous mark to `name`, so the marks
+    in one frame add up to the whole frame. Sections can be nested names such as
+    "task:MoveTask/rmp.forward"; a report lists every section with its share.
+    """
+
+    def __init__(self, every: int) -> None:
+        self.every = every
+        self.window = defaultdict(float)
+        self.total = defaultdict(float)
+        self.window_calls = defaultdict(int)
+        self.total_calls = defaultdict(int)
+        self.window_frames = 0
+        self.total_frames = 0
+        self.window_start = self.last = time.perf_counter()
+
+    def start(self) -> None:
+        """Begin timing the loop (drops anything marked during start-up)."""
+        self.window.clear()
+        self.window_calls.clear()
+        self.window_start = self.last = time.perf_counter()
+
+    def mark(self, name: str) -> None:
+        if not self.every:
+            return
+        now = time.perf_counter()
+        self.window[name] += now - self.last
+        self.window_calls[name] += 1
+        self.last = now
+
+    def frame_done(self, sim_dt: float) -> None:
+        if not self.every:
+            return
+        self.window_frames += 1
+        if self.window_frames >= self.every:
+            self._report("profile", self.window, self.window_calls, self.window_frames,
+                         time.perf_counter() - self.window_start, sim_dt)
+            for k, v in self.window.items():
+                self.total[k] += v
+                self.total_calls[k] += self.window_calls[k]
+            self.total_frames += self.window_frames
+            self.window.clear()
+            self.window_calls.clear()
+            self.window_frames = 0
+            self.window_start = time.perf_counter()
+
+    def summary(self, sim_dt: float) -> None:
+        if not self.every:
+            return
+        for k, v in self.window.items():
+            self.total[k] += v
+            self.total_calls[k] += self.window_calls[k]
+        self.total_frames += self.window_frames
+        if self.total_frames:
+            self._report("profile total", self.total, self.total_calls, self.total_frames,
+                         sum(self.total.values()), sim_dt)
+
+    @staticmethod
+    def _report(title, sections, calls, frames, wall, sim_dt) -> None:
+        ms = 1000.0 * wall / frames
+        say(f"{title}: {frames} frames, {ms:.1f} ms/frame ({1000.0 / ms:.1f} fps), "
+            f"real-time factor {sim_dt * frames / wall:.2f}")
+        for name, t in sorted(sections.items(), key=lambda kv: -kv[1]):
+            say(f"    {name:32s} {1000.0 * t / frames:8.2f} ms/frame  {100.0 * t / wall:5.1f}%  "
+                f"{1000.0 * t / calls[name]:8.2f} ms/call x {calls[name]}")
+
+
+PROFILE = LoopProfiler(LAUNCH.profile)
 
 
 def fmt(v) -> str:
@@ -346,6 +448,7 @@ class Arm:
             raise RuntimeError(f"No prim at {FRANKA_PRIM_PATH!r} in {usd_path}")
 
         self.world = World(stage_units_in_meters=1.0)
+        self.render_count = 0  # rendered steps so far; camera tasks wait for a fresh one
         self.franka = self.world.scene.add(Franka(prim_path=FRANKA_PRIM_PATH, name="franka"))
         self.world.reset()  # initialises physics handles; controllers need that first.
         self.fix_link_inertias()
@@ -605,9 +708,11 @@ class MoveTask(Task):
             target_end_effector_orientation=self.orientation,
         )
         arm.franka.apply_action(action)
+        PROFILE.mark("task:MoveTask/rmp.forward+apply")
         self.steps += 1
 
         pos, rot = arm.ee_pose()
+        PROFILE.mark("task:MoveTask/ee_pose")
         pos_err = float(np.linalg.norm(pos - self.position))
         rot_err = rotation_error_deg(self.target_rot, rot)
         if pos_err < MOVE_POS_TOL and rot_err < MOVE_ROT_TOL_DEG:
@@ -666,7 +771,9 @@ class CameraTask(Task):
     """Waits for a fresh frame from the hand camera, then hands it to save().
 
     With `immediate` set the task does not go through the command queue: the main
-    loop steps it alongside whatever is running, and it takes the next frame as is.
+    loop steps it alongside whatever is running, and it takes the next rendered
+    frame as is. Only frames rendered after start() count, so with --render-every
+    a stale image from before the command is never saved.
     """
 
     needs_depth = False
@@ -674,17 +781,20 @@ class CameraTask(Task):
 
     def start(self, arm: Arm) -> None:
         self.steps = 0
+        self.renders_at_start = arm.render_count
 
     def step(self, arm: Arm) -> bool:
         if arm.camera is None:
             say("no camera in the stage; nothing captured.")
             return True
         self.steps += 1
-        if not self.immediate and self.steps < SNAP_SETTLE_STEPS:
+        fresh = arm.render_count - self.renders_at_start
+        if fresh < (1 if self.immediate else SNAP_SETTLE_STEPS):
             return False  # let the renderer catch up with the settled arm pose
 
         rgb = camera_rgb(arm.camera)
         depth = to_numpy(arm.camera.get_depth()) if self.needs_depth else None
+        PROFILE.mark(f"task:{type(self).__name__}/readback")
         have_depth = (not self.needs_depth) or (depth is not None and depth.size > 0)
         if rgb is None or not have_depth:
             if self.steps >= SNAP_MAX_WAIT_STEPS:
@@ -1140,6 +1250,13 @@ def build_task(argv):
     raise ValueError(f"unknown command {cmd!r} (type help)")
 
 
+def needs_render(current, captures, watch) -> bool:
+    """True when a camera task or `watch` will read this step's frame, so it must be rendered."""
+    if captures or isinstance(current, CameraTask):
+        return True
+    return watch is not None and watch.countdown <= 1
+
+
 def stdin_reader(cmd_queue: "queue.Queue[str]") -> None:
     """Runs in a background thread: the sim loop must never block on input()."""
     while True:
@@ -1174,8 +1291,18 @@ def main() -> None:
     watch = None          # the running WatchTask, if any
     quit_requested = False
 
+    sim_dt = arm.physics_dt()
+    PROFILE.start()
+    frame = 0
     while simulation_app.is_running() and not quit_requested:
-        arm.world.step(render=True)
+        render = frame % LAUNCH.render_every == 0 or needs_render(current, captures, watch)
+        arm.world.step(render=render)
+        frame += 1
+        if render:
+            arm.render_count += 1
+            PROFILE.mark("world.step (physics+render)")
+        else:
+            PROFILE.mark("world.step (physics only)")
 
         # Drain the console. Immediate commands run now; the rest queue up.
         while True:
@@ -1244,9 +1371,11 @@ def main() -> None:
                 else:
                     pending.append(task)
 
+        PROFILE.mark("commands")
         if quit_requested:
             break
         if not arm.world.is_playing():
+            PROFILE.frame_done(sim_dt)
             continue
 
         # First physics step after Stop/Play in the GUI: start over.
@@ -1265,16 +1394,25 @@ def main() -> None:
             say(f"> {current.label}")
             current.start(arm)
 
+        PROFILE.mark("task start")
+
+        task_name = f"task:{type(current).__name__}" if current is not None else "idle"
         if current is not None and current.step(arm):
             arm.hold()
             current = None
+        PROFILE.mark(task_name)
 
         captures = [task for task in captures if not task.step(arm)]
+        PROFILE.mark("captures (now)")
         if watch is not None:
             watch.step(arm)
+            PROFILE.mark("watch")
 
         arm.trace(current.label if current is not None else "idle")
+        PROFILE.mark("trace")
+        PROFILE.frame_done(sim_dt)
 
+    PROFILE.summary(sim_dt)
     if arm.trace_file is not None:
         arm.trace_file.close()
     if watch is not None:
