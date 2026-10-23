@@ -155,6 +155,37 @@ class TestMcapRecorder(unittest.TestCase):
         self.assertEqual(times, sorted(times))
         self.assertEqual(times[1], times[0])
 
+    def test_sim_carries_wall_time_and_rtf(self):
+        rec = McapRecorder(self.path, epoch_ns=1_000_000_000_000)
+        for i in range(31):                       # sim runs at half speed: 1/60 s per 1/30 s of wall time
+            rec.sim(i / 60, i, 1 / 60, wall_s=i / 30)
+        rec.sim(0.0, 0, 1 / 60, wall_s=1.05)      # `reset`
+        rec.sim(0.1, 6, 1 / 60, wall_s=1.15)      # then real time
+        rec.close()
+        sims = [msg for topic, _, msg, _ in read_all(self.path) if topic == "/sim"]
+        self.assertAlmostEqual(sims[30]["wall_time"], 1.0)
+        self.assertEqual(sims[30]["wall_clock"], {"sec": 1001, "nsec": 0})
+        self.assertEqual(sims[30]["timestamp"], {"sec": 1000, "nsec": 500_000_000}, "timeline stays on sim time")
+        self.assertAlmostEqual(sims[30]["rtf"], 0.5)
+        self.assertAlmostEqual(sims[30]["rtf_avg"], 0.5)
+        self.assertEqual(sims[31]["rtf"], 0.0, "window restarts after a reset")
+        self.assertAlmostEqual(sims[32]["rtf"], 1.0)
+        self.assertAlmostEqual(sims[32]["rtf_avg"], 0.6 / 1.15)
+
+    def test_reasoning_topics_are_separate(self):
+        rec = McapRecorder(self.path, epoch_ns=0)
+        rec.reasoning(0.0, "strategy", "three objects; bin is on the left")
+        rec.reasoning(0.1, "motor", "descend to frame z 0.04, fingers along X")
+        rec.command(0.2, "move 0.5 0 0.04")
+        with self.assertRaises(KeyError):
+            rec.reasoning(0.3, "other", "?")
+        rec.close()
+        msgs = {topic: (schema, msg) for topic, schema, msg, _ in read_all(self.path)}
+        self.assertEqual(set(msgs), {"/reasoning/strategy", "/reasoning/motor", "/commands"})
+        self.assertEqual(msgs["/reasoning/strategy"][0], "foxglove.Log")
+        self.assertEqual(msgs["/reasoning/strategy"][1]["message"], "three objects; bin is on the left")
+        self.assertEqual(msgs["/reasoning/motor"][1]["name"], "motor")
+
     def test_write_after_close_is_ignored(self):
         rec = McapRecorder(self.path, epoch_ns=0)
         rec.sim(0.0, 0, 1 / 60)
