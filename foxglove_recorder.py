@@ -12,7 +12,11 @@ Topics written:
     /ee_pose               foxglove.PoseInFrame     end-effector (between the fingertips), world frame
     /tf                    foxglove.FrameTransforms world -> every Franka link, hand camera (optical frame)
     /task                  JSON   {event: "start"|"done"|"aborted", label} when a queued command changes
-    /commands              foxglove.Log  every line typed at the arm> prompt / fed on stdin
+    /commands              foxglove.Log  every arm_cli command typed at the arm> prompt / fed on stdin
+                                  (commentary - think / motor / note / mark - is left out)
+    /reasoning/strategy    foxglove.Log  `think` text: overarching ideas, plans, problem solving
+    /reasoning/motor       foxglove.Log  `motor` text: motor-control ideas (grasp heights, waypoints,
+                                  orientations, why a motion went wrong)
     /log                   foxglove.Log  every "[arm] ..." line the CLI prints
     /hand_camera/image     foxglove.CompressedImage  JPEG from the hand camera, throttled (see image_period)
     /hand_camera/calibration  foxglove.CameraCalibration  intrinsics, once per start and on resolution change
@@ -21,12 +25,16 @@ Topics written:
     /notes                 foxglove.Log  free text from the `note` (immediate) / `mark` (queued) commands
     /hand_camera/points    foxglove.PointCloud  the world-frame cloud of every `points` capture
     /viewport/image        foxglove.CompressedImage  the Isaac Sim perspective viewport, same throttle
-    /sim                   JSON   {sim_time, step, physics_dt} every step
+    /sim                   JSON   every step: sim_time (s), wall_time (wall s since the recording
+                                  started), wall_clock (real date/time), rtf (sim/wall speed over
+                                  the last ~1 s), rtf_avg (since the recording started), step, physics_dt
 
 Time: every message carries one clock, `epoch + simulated time`, both as its MCAP
 log time and inside its `timestamp` field. The epoch is the wall-clock moment the
 recording started, so the Foxglove timeline shows a real date but advances with
-the simulation (renders that stall the sim do not stretch the timeline).
+the simulation (renders that stall the sim do not stretch the timeline). Wall
+time is on /sim: plot `/sim.wall_time` and `/sim.sim_time` against the timeline,
+or `/sim.rtf` for how fast the sim ran at each moment.
 
 This module must stay importable without Isaac Sim: arm_cli.py hands it plain
 numpy arrays, and test_foxglove_recorder.py exercises it on its own.
@@ -37,7 +45,8 @@ import io
 import json
 import os
 import time
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from mcap.writer import CompressionType, Writer
@@ -49,6 +58,9 @@ CAMERA_FRAME = "hand_camera"
 # foxglove.PointCloud NumericType / foxglove.Log LogLevel enum values.
 PC_UINT8, PC_UINT32, PC_FLOAT32 = 1, 5, 7
 LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR = 1, 2, 3, 4
+
+# /sim.rtf is sim time / wall time over roughly this much recent wall time.
+RTF_WINDOW_S = 1.0
 
 # Point cloud layout: x y z float32 + packed rgba uint32 = 16 bytes per point.
 POINT_DTYPE = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgba", "<u4")])
@@ -127,7 +139,11 @@ SCHEMAS: Dict[str, dict] = {
     ),
     "arm_cli.Task": _obj({"timestamp": _TIME, "event": _STR, "label": _STR}, title="arm_cli.Task"),
     "arm_cli.Sim": _obj(
-        {"timestamp": _TIME, "sim_time": _NUM, "step": _INT, "physics_dt": _NUM}, title="arm_cli.Sim"
+        {
+            "timestamp": _TIME, "sim_time": _NUM, "wall_time": _NUM, "wall_clock": _TIME,
+            "rtf": _NUM, "rtf_avg": _NUM, "step": _INT, "physics_dt": _NUM,
+        },
+        title="arm_cli.Sim",
     ),
 }
 
@@ -142,10 +158,15 @@ TOPICS: Dict[str, str] = {
     "/hand_camera/calibration": "foxglove.CameraCalibration",
     "/hand_camera/retrieved": "foxglove.CompressedImage",
     "/notes": "foxglove.Log",
+    "/reasoning/strategy": "foxglove.Log",
+    "/reasoning/motor": "foxglove.Log",
     "/hand_camera/points": "foxglove.PointCloud",
     "/viewport/image": "foxglove.CompressedImage",
     "/sim": "arm_cli.Sim",
 }
+
+
+REASONING_TOPICS: Dict[str, str] = {"strategy": "/reasoning/strategy", "motor": "/reasoning/motor"}
 
 
 def _time(ns: int) -> dict:
@@ -232,6 +253,9 @@ class McapRecorder:
         self._last_image_t: Dict[str, float] = {}
         self._calibration: Dict[str, Tuple[int, int]] = {}
         self._last_ns = 0
+        self._wall0 = time.monotonic()
+        self._rtf_window: Deque[Tuple[float, float]] = deque()   # (wall_s, sim_s) of recent /sim samples
+        self._sim_elapsed = 0.0   # sim seconds recorded, summed across `reset`s
         self.closed = False
 
     # ---- plumbing -----------------------------------------------------------------
@@ -314,8 +338,30 @@ class McapRecorder:
             ]
         })
 
-    def sim(self, t: float, step: int, physics_dt: float) -> None:
-        self.write("/sim", t, {"sim_time": float(t), "step": int(step), "physics_dt": float(physics_dt)})
+    def sim(self, t: float, step: int, physics_dt: float, wall_s: Optional[float] = None) -> None:
+        """Both clocks side by side. `wall_s` is wall-clock seconds since the recording
+        started (default: measured now; tests pass it in)."""
+        if wall_s is None:
+            wall_s = time.monotonic() - self._wall0
+        t, wall_s = float(t), float(wall_s)
+        last = self._rtf_window[-1] if self._rtf_window else None
+        if last is not None and t >= last[1]:
+            self._sim_elapsed += t - last[1]
+        elif last is not None:
+            self._rtf_window.clear()   # `reset` restarted the sim clock
+        self._rtf_window.append((wall_s, t))
+        while len(self._rtf_window) > 2 and wall_s - self._rtf_window[1][0] >= RTF_WINDOW_S:
+            self._rtf_window.popleft()
+        w0, s0 = self._rtf_window[0]
+        self.write("/sim", t, {
+            "sim_time": t,
+            "wall_time": wall_s,
+            "wall_clock": _time(self.epoch_ns + int(round(wall_s * 1e9))),
+            "rtf": (t - s0) / (wall_s - w0) if wall_s > w0 else 0.0,
+            "rtf_avg": self._sim_elapsed / wall_s if wall_s > 0 else 0.0,
+            "step": int(step),
+            "physics_dt": float(physics_dt),
+        })
 
     # ---- events -------------------------------------------------------------------
     def task(self, t: float, event: str, label: str) -> None:
@@ -330,6 +376,12 @@ class McapRecorder:
     def note(self, t: float, text: str, source: str = "note") -> None:
         """Free text typed by the user, stamped at `t` like any other message."""
         self.write("/notes", t, {"level": LOG_INFO, "message": text, "name": source, "file": "", "line": 0})
+
+    def reasoning(self, t: float, kind: str, text: str) -> None:
+        """The operator's thinking: kind "strategy" (overall plan, problem solving) or
+        "motor" (how to move: grasp heights, waypoints, orientations, speeds)."""
+        topic = REASONING_TOPICS[kind]
+        self.write(topic, t, {"level": LOG_INFO, "message": text, "name": kind, "file": "", "line": 0})
 
     def retrieved_image(self, t: float, rgb: np.ndarray, path: str = "") -> None:
         """An image arm_cli wrote to disk (snap / points / watch). `path` goes to /log."""

@@ -63,10 +63,16 @@ Commands (type `help` at the arm> prompt):
                                   at the moment it is typed. Use it to annotate what you see.
     mark TEXT...                  the same, but queued: the note is stamped when its turn comes in
                                   the command sequence (e.g. right after a move finishes).
-    quit                          close Isaac Sim.
+    think TEXT...                 immediately record overarching ideas / problem solving on
+                                  /reasoning/strategy (no prefix needed; the topic says what it is).
+    motor TEXT...                 immediately record motor-control reasoning (grasp heights,
+                                  waypoints, orientations, why a motion failed) on /reasoning/motor.
+                                  None of note / mark / think / motor appear on /commands, which
+                                  holds only the arm_cli commands themselves.
+    quit                         close Isaac Sim.
 
 Commands run one after another in the order given. `status`, `stop`, `help`, `quit`,
-`watch`, `record`, `note` and `snap`/`points` with `now` take effect immediately;
+`watch`, `record`, `note`, `think`, `motor` and `snap`/`points` with `now` take effect immediately;
 everything else waits its turn.
 
 Positions are in the world frame of the stage. The frame that `move` targets and `pose`
@@ -272,6 +278,10 @@ VIEWPORT_RESOLUTION = (1280, 720)
 VIEWPORT_FRAME = "viewport_camera"
 
 EOF_SENTINEL = "\x00eof"
+
+# Commentary goes to its own topics, never to /commands (which holds only arm commands).
+REASONING_COMMANDS = {"think": "strategy", "motor": "motor"}
+COMMENTARY_COMMANDS = {"note", "mark", *REASONING_COMMANDS}
 # ----------------------------------------------------------------------------
 
 _ARM = None  # the live Arm, so say() can copy its output into the recording
@@ -1230,6 +1240,8 @@ HELP = """Commands:
                                      file for Foxglove (default runs/foxglove/arm_<timestamp>.mcap)
   note TEXT...                       immediately: write TEXT into the recording (/notes), stamped now
   mark TEXT...                       same, but queued: stamped when its turn comes in the sequence
+  think TEXT...                      immediately: overall plan / problem solving -> /reasoning/strategy
+  motor TEXT...                      immediately: motor-control reasoning -> /reasoning/motor
   help | quit"""
 
 
@@ -1431,7 +1443,7 @@ def main() -> None:
                 say(f"could not parse {line!r}: {exc}")
                 continue
             cmd = argv[0].lower()
-            if arm.recorder is not None:
+            if arm.recorder is not None and cmd not in COMMENTARY_COMMANDS:
                 arm.recorder.command(arm.sim_time(), line)
             if cmd in ("quit", "exit"):
                 quit_requested = True
@@ -1461,6 +1473,16 @@ def main() -> None:
                 else:
                     arm.recorder.note(arm.sim_time(), text, "note")
                     say(f"note: {text}")
+            elif cmd in REASONING_COMMANDS:
+                kind = REASONING_COMMANDS[cmd]
+                text = line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else ""
+                if not text:
+                    say(f"error: usage: {cmd} TEXT...")
+                    continue
+                if arm.recorder is not None:
+                    arm.recorder.reasoning(arm.sim_time(), kind, text)
+                # Echo to the terminal only: copying it to /log would mix it back in.
+                print(f"[arm] {kind}{'' if arm.recorder else ' (not recording)'}: {text}", flush=True)
             elif cmd == "record":
                 if len(argv) == 2 and argv[1].lower() in ("off", "stop"):
                     if arm.recorder is None:
