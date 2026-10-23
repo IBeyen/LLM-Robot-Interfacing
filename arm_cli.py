@@ -983,6 +983,46 @@ class WatchTask(Task):
         return False
 
 
+class WatchTask(Task):
+    """Rewrites one PNG with the latest hand-camera frame every `period` simulated seconds.
+
+    Never queued and never finishes: the main loop steps it next to the running
+    command until `watch off`. Each frame is written to a temporary file and
+    renamed over the target, so a reader never sees a half-written image.
+    """
+
+    def __init__(self, period: float, path: str) -> None:
+        self.period = period
+        self.path = path
+        self.label = f"watch -> {path} every {period:g} s"
+
+    def start(self, arm: Arm) -> None:
+        self.every = max(1, int(round(self.period / arm.physics_dt())))
+        self.countdown = 0
+        self.frames = 0
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+
+    def step(self, arm: Arm) -> bool:
+        self.countdown -= 1
+        if self.countdown > 0:
+            return False
+        rgb = camera_rgb(arm.camera)
+        if rgb is None or not rgb.any():
+            # No frame yet, or the all-black one the renderer hands out right after a
+            # reset: keep the last good image and try again next step.
+            return False
+        tmp =self.path + ".tmp"
+        try:
+            # Fast compression: this runs inside the simulation loop.
+            Image.fromarray(rgb).save(tmp, format="PNG", compress_level=1)
+            os.replace(tmp, self.path)
+            self.frames += 1
+        except OSError:
+            pass  # target is open in a viewer right now; the next frame replaces it
+        self.countdown = self.every
+        return False
+
+
 class PickPlaceTask(Task):
     def __init__(self, pick, place, yaw_deg: float) -> None:
         self.pick = np.asarray(pick, dtype=float)
