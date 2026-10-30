@@ -24,7 +24,10 @@ Topics written:
                                   `points` and `watch` frame, full quality, at the moment it was saved
     /notes                 foxglove.Log  free text from the `note` (immediate) / `mark` (queued) commands
     /hand_camera/points    foxglove.PointCloud  the world-frame cloud of every `points` capture
-    /viewport/image        foxglove.CompressedImage  the Isaac Sim perspective viewport, same throttle
+    /viewport/image        foxglove.CompressedImage  the Isaac Sim main viewport's camera, same throttle
+    /viewport/calibration  foxglove.CameraCalibration  its intrinsics, as for the hand camera
+    /viewport/retrieved    foxglove.CompressedImage  every `snap view` / `points view` / `watch view` frame
+    /viewport/points       foxglove.PointCloud  the world-frame cloud of every `points view` capture
     /sim                   JSON   every step: sim_time (s), wall_time (wall s since the recording
                                   started), wall_clock (real date/time), rtf (sim/wall speed over
                                   the last ~1 s), rtf_avg (since the recording started), step, physics_dt
@@ -162,6 +165,9 @@ TOPICS: Dict[str, str] = {
     "/reasoning/motor": "foxglove.Log",
     "/hand_camera/points": "foxglove.PointCloud",
     "/viewport/image": "foxglove.CompressedImage",
+    "/viewport/calibration": "foxglove.CameraCalibration",
+    "/viewport/retrieved": "foxglove.CompressedImage",
+    "/viewport/points": "foxglove.PointCloud",
     "/sim": "arm_cli.Sim",
 }
 
@@ -383,9 +389,10 @@ class McapRecorder:
         topic = REASONING_TOPICS[kind]
         self.write(topic, t, {"level": LOG_INFO, "message": text, "name": kind, "file": "", "line": 0})
 
-    def retrieved_image(self, t: float, rgb: np.ndarray, path: str = "") -> None:
+    def retrieved_image(self, t: float, rgb: np.ndarray, path: str = "",
+                        topic: str = "/hand_camera/retrieved", frame_id: str = CAMERA_FRAME) -> None:
         """An image arm_cli wrote to disk (snap / points / watch). `path` goes to /log."""
-        self.image("/hand_camera/retrieved", t, rgb, quality=95)
+        self.image(topic, t, rgb, frame_id=frame_id, quality=95)
         if path:
             self.log(t, f"retrieved image -> {path}")
 
