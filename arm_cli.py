@@ -33,9 +33,17 @@ Commands (type `help` at the arm> prompt):
                                   Add `ply` to also write a coloured point cloud (<PATH>.ply) that
                                   opens in MeshLab / CloudCompare. Default PATH is
                                   captures/points_<timestamp>. `now` works as for snap.
-    watch [SECONDS] [PATH]        keep PATH (default captures/live.png) refreshed with the hand
+    snap ... view | points ... view
+                                  the same from the camera the main Isaac Sim viewport looks
+                                  through (Perspective unless switched in the viewport's camera
+                                  menu; followed when switched), at --viewport-res. The XYZ come
+                                  out in the same world frame as the hand camera's. Default paths
+                                  are captures/view_capture_<timestamp>.png and
+                                  captures/view_points_<timestamp>.
+    watch [SECONDS] [PATH] [view] keep PATH (default captures/live.png) refreshed with the hand
                                   camera image every SECONDS (default 1) of simulated time, in
                                   the background, whatever else is running. `watch off` ends it.
+                                  With `view`: the viewport image, default captures/live_view.png.
     pick X Y Z [to PX PY PZ] [yaw DEG]
                                   run the built-in PickPlaceController: grasp the object whose
                                   centre is at X Y Z, release it at PX PY PZ (default: above the
@@ -83,7 +91,7 @@ Launch flags: --headless, --usd PATH, -c "cmd; cmd", --quit-when-done, --events-
 Arm.fix_link_inertias for why they are repaired by default), --trace FILE (per-step
 joint CSV for diagnosing motion problems), --profile [FRAMES] (wall time per part of the
 main loop), --render-every N (render every Nth physics step, default 8), --camera-res WxH (hand
-camera size), --record [PATH] (start recording to MCAP at launch; --record-hz,
+camera size), --viewport-res WxH (viewport capture size), --record [PATH] (start recording to MCAP at launch; --record-hz,
 --record-stride and --no-record-viewport tune it).
 Tests: test_arm_cli.py, test_foxglove_recorder.py.
 """
@@ -177,16 +185,23 @@ def parse_launch_args():
         help="hand camera resolution (default 1920x1080). Smaller renders faster; "
              "snap/points images and XYZ arrays come out at this size",
     )
+    parser.add_argument(
+        "--viewport-res", default="1280x720", metavar="WxH",
+        help="resolution of `snap view` / `points view` / `watch view` captures and of "
+             "/viewport/image in the recording (default 1280x720)",
+    )
     args = parser.parse_args()
     if args.render_every < 1:
         parser.error("--render-every must be at least 1")
-    try:
-        w, h = (int(v) for v in args.camera_res.lower().split("x"))
-    except ValueError:
-        parser.error("--camera-res must look like 1280x720")
-    if w < 16 or h < 16:
-        parser.error("--camera-res: width and height must be at least 16")
-    args.camera_res = (w, h)
+    for flag in ("camera_res", "viewport_res"):
+        name = "--" + flag.replace("_", "-")
+        try:
+            w, h = (int(v) for v in getattr(args, flag).lower().split("x"))
+        except ValueError:
+            parser.error(f"{name} must look like 1280x720")
+        if w < 16 or h < 16:
+            parser.error(f"{name}: width and height must be at least 16")
+        setattr(args, flag, (w, h))
     return args
 
 
@@ -300,12 +315,20 @@ SNAP_SETTLE_STEPS = 5       # rendered frames to wait so the image matches the s
 SNAP_MAX_WAIT_STEPS = 240
 WATCH_DEFAULT_PERIOD_S = 1.0
 WATCH_DEFAULT_PATH = os.path.join(CAPTURE_DIR, "live.png")
+WATCH_VIEW_DEFAULT_PATH = os.path.join(CAPTURE_DIR, "live_view.png")
 
 # Foxglove recording (see foxglove_recorder.py and the `record` command).
 RECORD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "foxglove")
-VIEWPORT_CAMERA_PRIM_PATH = "/OmniverseKit_Persp"   # the GUI's Perspective viewport camera
-VIEWPORT_RESOLUTION = (1280, 720)
+VIEWPORT_CAMERA_PRIM_PATH = "/OmniverseKit_Persp"   # the GUI's Perspective camera; fallback
+VIEWPORT_RESOLUTION = LAUNCH.viewport_res            # (width, height); --viewport-res
 VIEWPORT_FRAME = "viewport_camera"
+# Which camera a capture command reads: the hand camera, or the main viewport's
+# active camera (`view` keyword). Recording topics per source.
+HAND, VIEW = "hand", "view"
+CAPTURE_TOPICS = {
+    HAND: ("/hand_camera/retrieved", "/hand_camera/points", CAMERA_FRAME),
+    VIEW: ("/viewport/retrieved", "/viewport/points", VIEWPORT_FRAME),
+}
 
 EOF_SENTINEL = "\x00eof"
 
@@ -488,7 +511,10 @@ class Arm:
     def __init__(self, usd_path: str) -> None:
         global _ARM
         self.recorder = None
-        self.viewport_camera = None
+        self.viewport_camera = None       # see viewport_cam(); attached on first use
+        self.viewport_camera_path = None
+        self.viewport_has_depth = False
+        self.viewport_failed_path = None
         _ARM = self
         say(f"opening stage {usd_path}")
         if not open_stage(usd_path):
@@ -557,8 +583,8 @@ class Arm:
             path = os.path.join(RECORD_DIR, datetime.now().strftime("arm_%Y%m%d_%H%M%S.mcap"))
         elif not path.lower().endswith(".mcap"):
             path += ".mcap"
-        if not LAUNCH.no_record_viewport and self.viewport_camera is None:
-            self.viewport_camera = self._attach_viewport_camera()
+        if not LAUNCH.no_record_viewport:
+            self.viewport_cam()
         self.recorder = McapRecorder(
             path,
             image_period_s=1.0 / max(LAUNCH.record_hz, 1e-3),
@@ -577,19 +603,52 @@ class Arm:
         size_mb = os.path.getsize(rec.path) / 1e6
         say(f"recording saved: {rec.path} ({size_mb:.1f} MB; {rec.summary()})")
 
-    def _attach_viewport_camera(self):
-        """A render product on the GUI's Perspective camera, so the recording shows the scene
-        the way the user sees it. Returns None (with a warning) when that is not possible."""
-        if not is_prim_path_valid(VIEWPORT_CAMERA_PRIM_PATH):
-            say(f"WARNING: no viewport camera at {VIEWPORT_CAMERA_PRIM_PATH!r}; /viewport/image is off.")
-            return None
+    @staticmethod
+    def active_viewport_camera_path() -> str:
+        """Prim path of the camera the main viewport looks through (it changes when the user
+        picks another camera in the viewport's camera menu). Perspective when unknown."""
         try:
-            cam = Camera(prim_path=VIEWPORT_CAMERA_PRIM_PATH, resolution=VIEWPORT_RESOLUTION)
-            cam.initialize()
-            return cam
-        except Exception as exc:
-            say(f"WARNING: could not attach to the viewport camera ({exc}); /viewport/image is off.")
-            return None
+            from omni.kit.viewport.utility import get_active_viewport
+            viewport = get_active_viewport()
+            if viewport is not None and viewport.camera_path:
+                return str(viewport.camera_path)
+        except Exception:
+            pass
+        return VIEWPORT_CAMERA_PRIM_PATH
+
+    def viewport_cam(self, depth: bool = False):
+        """A render product on the main viewport's active camera, so captures and the recording
+        show the scene the way the user sees it. Follows the viewport when it switches camera.
+        `depth` also attaches the depth annotator (`points view`). Returns None (with a
+        warning) when that is not possible."""
+        path = self.active_viewport_camera_path()
+        if self.viewport_camera is not None and path != self.viewport_camera_path:
+            say(f"viewport camera changed: {self.viewport_camera_path} -> {path}")
+            self.viewport_camera.destroy()
+            self.viewport_camera = None
+        if self.viewport_camera is None:
+            if path == self.viewport_failed_path:
+                return None   # already warned; the recording calls this every step
+            try:
+                if not is_prim_path_valid(path):
+                    raise RuntimeError("no such prim")
+                cam = Camera(prim_path=path, resolution=VIEWPORT_RESOLUTION)
+                cam.initialize()
+            except Exception as exc:
+                say(f"WARNING: could not attach to the viewport camera {path!r} ({exc}); viewport images are off.")
+                self.viewport_failed_path = path
+                return None
+            self.viewport_camera = cam
+            self.viewport_camera_path = path
+            self.viewport_has_depth = False
+        if depth and not self.viewport_has_depth:
+            self.viewport_camera.add_distance_to_image_plane_to_frame()
+            self.viewport_has_depth = True
+        return self.viewport_camera
+
+    def capture_camera(self, source: str, depth: bool = False):
+        """The camera a capture command reads: the hand camera or the viewport's (see viewport_cam)."""
+        return self.viewport_cam(depth) if source == VIEW else self.camera
 
     def link_poses(self):
         """{link name: (position, (w, x, y, z))} for every articulation link, from one PhysX read."""
@@ -629,12 +688,14 @@ class Arm:
             pos, rot = self.ee_pose()
             rec.ee_pose(t, pos, rot_matrix_to_quat(rot))
 
+            # Follows the viewport onto whichever camera it is switched to.
+            viewport = None if LAUNCH.no_record_viewport else self.viewport_cam()
             frames = [(name, p, quat) for name, (p, quat) in self.link_poses().items()]
             if self.camera is not None:
                 cam_pos, cam_quat = self.camera.get_world_pose(camera_axes="ros")
                 frames.append((CAMERA_FRAME, np.asarray(cam_pos, dtype=float), np.asarray(cam_quat, dtype=float)))
-            if self.viewport_camera is not None:
-                vp_pos, vp_quat = self.viewport_camera.get_world_pose(camera_axes="ros")
+            if viewport is not None:
+                vp_pos, vp_quat = viewport.get_world_pose(camera_axes="ros")
                 frames.append((VIEWPORT_FRAME, np.asarray(vp_pos, dtype=float), np.asarray(vp_quat, dtype=float)))
             rec.transforms(t, frames)
             rec.sim(t, int(self.world.current_time_step_index), self.physics_dt())
@@ -646,25 +707,29 @@ class Arm:
                 if rgb is not None and rgb.any():
                     rec.camera_calibration(t, self.camera.get_intrinsics_matrix(), rgb.shape[1], rgb.shape[0])
                     rec.image("/hand_camera/image", t, rgb)
-            if self.viewport_camera is not None and rec.image_due("/viewport/image", t):
-                rgb = camera_rgb(self.viewport_camera)
+            if viewport is not None and rec.image_due("/viewport/image", t):
+                rgb = camera_rgb(viewport)
                 if rgb is not None and rgb.any():
+                    rec.camera_calibration(t, viewport.get_intrinsics_matrix(), rgb.shape[1], rgb.shape[0],
+                                           frame_id=VIEWPORT_FRAME, topic="/viewport/calibration")
                     rec.image("/viewport/image", t, rgb, frame_id=VIEWPORT_FRAME)
         except Exception as exc:
             # Never let the recording take the simulation down: close the file and stop.
             say(f"WARNING: recording stopped after an error: {exc!r}")
             self.stop_recording()
 
-    def record_capture(self, rgb: np.ndarray, path: str = "", xyz=None) -> None:
+    def record_capture(self, rgb: np.ndarray, path: str = "", xyz=None, source: str = HAND) -> None:
         """An image arm_cli handed out (`snap`, `points`, `watch`): goes to /hand_camera/retrieved
-        at full quality, plus the world-frame cloud on /hand_camera/points if given."""
+        (or /viewport/retrieved) at full quality, plus the world-frame cloud on
+        /hand_camera/points (or /viewport/points) if given."""
         if self.recorder is None:
             return
+        image_topic, points_topic, frame_id = CAPTURE_TOPICS[source]
         t = self.sim_time()
-        self.recorder.retrieved_image(t, rgb, path)
+        self.recorder.retrieved_image(t, rgb, path, topic=image_topic, frame_id=frame_id)
         if xyz is not None:
-            n = self.recorder.point_cloud(t, xyz, rgb)
-            say(f"recorded {n} points on /hand_camera/points (stride {self.recorder.point_stride})")
+            n = self.recorder.point_cloud(t, xyz, rgb, topic=points_topic)
+            say(f"recorded {n} points on {points_topic} (stride {self.recorder.point_stride})")
 
     def link_pose(self, link_name: str):
         """World position and (w, x, y, z) quaternion of one articulation link.
@@ -950,7 +1015,8 @@ class GripperTask(Task):
 
 
 class CameraTask(Task):
-    """Waits for a fresh frame from the hand camera, then hands it to save().
+    """Waits for a fresh frame from the hand camera (or, with source VIEW, the main
+    viewport's camera), then hands it to save().
 
     With `immediate` set the task does not go through the command queue: the main
     loop steps it alongside whatever is running, and it takes the next rendered
@@ -960,22 +1026,27 @@ class CameraTask(Task):
 
     needs_depth = False
     immediate = False
+    source = HAND
 
     def start(self, arm: Arm) -> None:
         self.steps = 0
         self.renders_at_start = arm.render_count
+        # Fetched here, not in step(): a viewport depth annotator attached now only
+        # fills on renders after this point, which the freshness wait below covers.
+        self.cam = arm.capture_camera(self.source, self.needs_depth)
 
     def step(self, arm: Arm) -> bool:
-        if arm.camera is None:
-            say("no camera in the stage; nothing captured.")
+        if self.cam is None:
+            say("no viewport camera; nothing captured." if self.source == VIEW
+                else "no camera in the stage; nothing captured.")
             return True
         self.steps += 1
         fresh = arm.render_count - self.renders_at_start
         if fresh < (1 if self.immediate else SNAP_SETTLE_STEPS):
             return False  # let the renderer catch up with the settled arm pose
 
-        rgb = camera_rgb(arm.camera)
-        depth = to_numpy(arm.camera.get_depth()) if self.needs_depth else None
+        rgb = camera_rgb(self.cam)
+        depth = to_numpy(self.cam.get_depth()) if self.needs_depth else None
         PROFILE.mark(f"task:{type(self).__name__}/readback")
         have_depth = (not self.needs_depth) or (depth is not None and depth.size > 0)
         if rgb is None or not have_depth:
@@ -995,16 +1066,18 @@ class CameraTask(Task):
 
 
 class SnapTask(CameraTask):
-    def __init__(self, path=None, with_depth=False, immediate=False) -> None:
+    def __init__(self, path=None, with_depth=False, immediate=False, source=HAND) -> None:
         self.path = path
         self.needs_depth = with_depth
         self.immediate = immediate
-        self.label = f"snap -> {path or 'captures/'}"
+        self.source = source
+        self.label = f"snap{' view' if source == VIEW else ''} -> {path or 'captures/'}"
 
     def start(self, arm: Arm) -> None:
         super().start(arm)
         if self.path is None:
-            stamp = datetime.now().strftime("capture_%Y%m%d_%H%M%S")
+            prefix = "view_capture_" if self.source == VIEW else "capture_"
+            stamp = datetime.now().strftime(prefix + "%Y%m%d_%H%M%S")
             self.path = os.path.join(CAPTURE_DIR, stamp + ".png")
 
     def save(self, arm: Arm, rgb: np.ndarray, depth) -> None:
@@ -1015,7 +1088,7 @@ class SnapTask(CameraTask):
             depth_path = os.path.splitext(self.path)[0] + "_depth.npy"
             np.save(depth_path, depth)
             say(f"saved {depth_path} (float32 metres, shape {depth.shape})")
-        arm.record_capture(rgb, self.path)
+        arm.record_capture(rgb, self.path, source=self.source)
 
 
 class PointsTask(CameraTask):
@@ -1023,22 +1096,24 @@ class PointsTask(CameraTask):
 
     needs_depth = True
 
-    def __init__(self, base=None, with_ply=False, immediate=False) -> None:
+    def __init__(self, base=None, with_ply=False, immediate=False, source=HAND) -> None:
         self.base = base
         self.with_ply = with_ply
         self.immediate = immediate
-        self.label = f"points -> {base or 'captures/'}"
+        self.source = source
+        self.label = f"points{' view' if source == VIEW else ''} -> {base or 'captures/'}"
 
     def start(self, arm: Arm) -> None:
         super().start(arm)
         if self.base is None:
-            self.base = os.path.join(CAPTURE_DIR, datetime.now().strftime("points_%Y%m%d_%H%M%S"))
+            prefix = "view_points_" if self.source == VIEW else "points_"
+            self.base = os.path.join(CAPTURE_DIR, datetime.now().strftime(prefix + "%Y%m%d_%H%M%S"))
         elif os.path.splitext(self.base)[1].lower() in (".npy", ".png", ".ply"):
             self.base = os.path.splitext(self.base)[0]
 
     def save(self, arm: Arm, rgb: np.ndarray, depth) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self.base)), exist_ok=True)
-        xyz = unproject_depth(arm.camera, depth)
+        xyz = unproject_depth(self.cam, depth)
 
         Image.fromarray(rgb).save(self.base + ".png")
         np.save(self.base + ".npy", xyz)
@@ -1055,21 +1130,23 @@ class PointsTask(CameraTask):
         if self.with_ply:
             n = write_ply(self.base + ".ply", xyz, rgb)
             say(f"saved {self.base}.ply ({n} coloured points)")
-        arm.record_capture(rgb, self.base + ".png", xyz)
+        arm.record_capture(rgb, self.base + ".png", xyz, source=self.source)
 
 
 class WatchTask(Task):
-    """Rewrites one PNG with the latest hand-camera frame every `period` simulated seconds.
+    """Rewrites one PNG with the latest hand-camera (or viewport, source VIEW) frame
+    every `period` simulated seconds.
 
     Never queued and never finishes: the main loop steps it next to the running
     command until `watch off`. Each frame is written to a temporary file and
     renamed over the target, so a reader never sees a half-written image.
     """
 
-    def __init__(self, period: float, path: str) -> None:
+    def __init__(self, period: float, path: str, source: str = HAND) -> None:
         self.period = period
         self.path = path
-        self.label = f"watch -> {path} every {period:g} s"
+        self.source = source
+        self.label = f"watch{' view' if source == VIEW else ''} -> {path} every {period:g} s"
 
     def start(self, arm: Arm) -> None:
         self.every = max(1, int(round(self.period / arm.physics_dt())))
@@ -1081,7 +1158,9 @@ class WatchTask(Task):
         self.countdown -= 1
         if self.countdown > 0:
             return False
-        rgb = camera_rgb(arm.camera)
+        # Looked up each time so a viewport watch follows the viewport's camera switches.
+        cam = arm.capture_camera(self.source)
+        rgb = camera_rgb(cam) if cam is not None else None
         if rgb is None or not rgb.any():
             # No frame yet, or the all-black one the renderer hands out right after a
             # reset: keep the last good image and try again next step.
@@ -1092,7 +1171,7 @@ class WatchTask(Task):
             Image.fromarray(rgb).save(tmp, format="PNG", compress_level=1)
             os.replace(tmp, self.path)
             self.frames += 1
-            arm.record_capture(rgb)   # no path: one log line per second would drown /log
+            arm.record_capture(rgb, source=self.source)   # no path: one log line per second would drown /log
         except OSError:
             pass  # target is open in a viewer right now; the next frame replaces it
         self.countdown = self.every
@@ -1297,12 +1376,15 @@ HELP = """Commands:
   move X Y Z q QW QX QY QZ           orientation as a quaternion (w x y z)
   move X Y Z keep                    keep the current orientation
   open | close                       gripper
-  snap [PATH] [depth] [now]          save a camera image (PNG), optionally depth too (.npy);
-                                     now = immediately, while the running command continues
-  points [PATH] [ply] [now]          save world XYZ of every pixel: PATH.npy (H,W,3) + PATH.png,
-                                     add ply for a coloured point cloud (PATH.ply); now as above
-  watch [SECONDS] [PATH] | watch off immediately: refresh PATH (default captures/live.png) with
-                                     the camera image every SECONDS (default 1) in the background
+  snap [PATH] [depth] [now] [view]   save a camera image (PNG), optionally depth too (.npy);
+                                     now = immediately, while the running command continues;
+                                     view = from the main viewport's camera, not the hand camera
+  points [PATH] [ply] [now] [view]   save world XYZ of every pixel: PATH.npy (H,W,3) + PATH.png,
+                                     add ply for a coloured point cloud (PATH.ply); now, view as above
+  watch [SECONDS] [PATH] [view] | watch off
+                                     immediately: refresh PATH (default captures/live.png, or
+                                     captures/live_view.png with view) with the camera image every
+                                     SECONDS (default 1) in the background
   pick X Y Z [to PX PY PZ] [yaw DEG] run the pick-and-place controller
   pose                               print the end-effector pose (runs in queue order)
   joints                             print joint readings, limits, and joint 1 reading vs physical
@@ -1369,46 +1451,59 @@ def parse_pick(args):
     return PickPlaceTask(pick, place, yaw)
 
 
+VIEW_WORDS = ("view", "viewport")
+
+
 def parse_snap(args):
     path = None
     with_depth = False
     immediate = False
+    source = HAND
     for tok in args:
         if tok.lower() == "depth":
             with_depth = True
         elif tok.lower() == "now":
             immediate = True
+        elif tok.lower() in VIEW_WORDS:
+            source = VIEW
         elif path is None:
             path = tok
         else:
-            raise ValueError("usage: snap [PATH] [depth] [now]")
-    return SnapTask(path, with_depth, immediate)
+            raise ValueError("usage: snap [PATH] [depth] [now] [view]")
+    return SnapTask(path, with_depth, immediate, source)
 
 
 def parse_points(args):
     base = None
     with_ply = False
     immediate = False
+    source = HAND
     for tok in args:
         if tok.lower() == "ply":
             with_ply = True
         elif tok.lower() == "now":
             immediate = True
+        elif tok.lower() in VIEW_WORDS:
+            source = VIEW
         elif base is None:
             base = tok
         else:
-            raise ValueError("usage: points [PATH] [ply] [now]")
-    return PointsTask(base, with_ply, immediate)
+            raise ValueError("usage: points [PATH] [ply] [now] [view]")
+    return PointsTask(base, with_ply, immediate, source)
 
 
 def parse_watch(args):
-    """`watch [SECONDS] [PATH]` -> WatchTask, `watch off` -> None."""
-    usage = "usage: watch [SECONDS] [PATH] | watch off"
+    """`watch [SECONDS] [PATH] [view]` -> WatchTask, `watch off` -> None."""
+    usage = "usage: watch [SECONDS] [PATH] [view] | watch off"
     if len(args) == 1 and args[0].lower() in ("off", "stop"):
         return None
     period = None
     path = None
+    source = HAND
     for tok in args:
+        if tok.lower() in VIEW_WORDS:
+            source = VIEW
+            continue
         try:
             value = float(tok)
         except ValueError:
@@ -1421,7 +1516,8 @@ def parse_watch(args):
             raise ValueError(usage)
     if period is not None and not period > 0:
         raise ValueError("watch: SECONDS must be greater than 0")
-    return WatchTask(WATCH_DEFAULT_PERIOD_S if period is None else period, path or WATCH_DEFAULT_PATH)
+    default_path = WATCH_VIEW_DEFAULT_PATH if source == VIEW else WATCH_DEFAULT_PATH
+    return WatchTask(WATCH_DEFAULT_PERIOD_S if period is None else period, path or default_path, source)
 
 
 def build_task(argv):
@@ -1591,7 +1687,7 @@ def main() -> None:
                 except ValueError as exc:
                     say(f"error: {exc}")
                     continue
-                if new_watch is not None and arm.camera is None:
+                if new_watch is not None and new_watch.source == HAND and arm.camera is None:
                     say("no camera in the stage; watch is disabled.")
                     continue
                 if watch is not None:
